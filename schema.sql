@@ -121,7 +121,10 @@ CREATE TABLE IF NOT EXISTS music_scrobble_link (
     recording_mbid  uuid REFERENCES music_recording(mbid),
     resolution_method text,
     resolution_score real,
+    resolution_attempts smallint DEFAULT 0,
     resolved_at     timestamptz,
+    reviewed_at     timestamptz,
+    manual_override boolean DEFAULT false,
     UNIQUE (artist_string, track_string)
 );
 

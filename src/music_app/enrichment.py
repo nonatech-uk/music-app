@@ -36,7 +36,12 @@ HC_BASE = os.environ.get("HC_BASE", "https://hc.mees.st/ping")
 SPOTIFY_TOKEN_PROXY_URL = os.environ.get("SPOTIFY_TOKEN_PROXY_URL", "")
 LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
 
+MUSICBRAINZ_TOKEN = os.environ.get("MUSICBRAINZ_TOKEN", "")
+
 musicbrainzngs.set_useragent("PIF-Enricher", "1.0", "stu@mees.st")
+if MUSICBRAINZ_TOKEN:
+    musicbrainzngs.auth(MUSICBRAINZ_TOKEN, MUSICBRAINZ_TOKEN)
+    musicbrainzngs.set_hostname("musicbrainz.org", use_https=True)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +122,10 @@ CREATE TABLE IF NOT EXISTS music_scrobble_link (
     recording_mbid  uuid REFERENCES music_recording(mbid),
     resolution_method text,
     resolution_score real,
+    resolution_attempts smallint DEFAULT 0,
     resolved_at     timestamptz,
+    reviewed_at     timestamptz,
+    manual_override boolean DEFAULT false,
     UNIQUE (artist_string, track_string)
 );
 CREATE INDEX IF NOT EXISTS idx_scrobble_link_artist_mbid ON music_scrobble_link (artist_mbid);
@@ -271,6 +279,7 @@ async def pass1_musicbrainz(pg: asyncpg.Connection) -> dict:
         JOIN artist a ON a.id = sl.artist_id
         WHERE sl.artist_mbid IS NULL
           AND sl.resolution_method IS DISTINCT FROM 'failed'
+          AND NOT COALESCE(sl.manual_override, false)
         ORDER BY sl.artist_string
         LIMIT $1
     """, MB_ARTIST_CAP)
@@ -332,6 +341,7 @@ async def pass1_musicbrainz(pg: asyncpg.Connection) -> dict:
         WHERE sl.artist_mbid IS NOT NULL
           AND sl.recording_mbid IS NULL
           AND sl.resolution_method != 'failed'
+          AND NOT COALESCE(sl.manual_override, false)
         ORDER BY play_count DESC
         LIMIT $1
     """, MB_RECORDING_CAP)
