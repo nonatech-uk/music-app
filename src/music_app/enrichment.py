@@ -14,6 +14,8 @@ import time
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 
+import httpx
+
 import asyncpg
 import musicbrainzngs
 from rapidfuzz import fuzz
@@ -31,8 +33,7 @@ FUZZY_THRESHOLD = int(os.environ.get("FUZZY_THRESHOLD", "90"))
 HC_UUID = os.environ.get("HC_UUID", "")
 HC_BASE = os.environ.get("HC_BASE", "https://hc.mees.st/ping")
 
-SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
-SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+SPOTIFY_TOKEN_PROXY_URL = os.environ.get("SPOTIFY_TOKEN_PROXY_URL", "")
 LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
 
 musicbrainzngs.set_useragent("PIF-Enricher", "1.0", "stu@mees.st")
@@ -427,24 +428,81 @@ async def pass1_musicbrainz(pg: asyncpg.Connection) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Pass 2: Spotify enrichment
+# Pass 2: Spotify enrichment (via token proxy)
 # ---------------------------------------------------------------------------
+
+class SpotifyClient:
+    """Thin Spotify Web API client that gets tokens from the token proxy."""
+
+    SPOTIFY_API = "https://api.spotify.com/v1"
+
+    def __init__(self, token_proxy_url: str):
+        self._proxy_url = token_proxy_url.rstrip("/")
+        self._client = httpx.Client(timeout=15)
+        self._token: str | None = None
+        self._token_expires_at: float = 0
+
+    def _ensure_token(self):
+        if self._token and time.time() < self._token_expires_at - 30:
+            return
+        resp = self._client.get(f"{self._proxy_url}/token/user")
+        resp.raise_for_status()
+        data = resp.json()
+        self._token = data["access_token"]
+        self._token_expires_at = time.time() + data.get("expires_in", 3600)
+
+    def _headers(self) -> dict:
+        self._ensure_token()
+        return {"Authorization": f"Bearer {self._token}"}
+
+    def search(self, q: str, type: str = "track", limit: int = 1) -> dict:
+        time.sleep(0.1)  # rate limiting
+        resp = self._client.get(
+            f"{self.SPOTIFY_API}/search",
+            params={"q": q, "type": type, "limit": limit},
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def artist(self, artist_id: str) -> dict:
+        time.sleep(0.1)
+        resp = self._client.get(
+            f"{self.SPOTIFY_API}/artists/{artist_id}",
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def audio_features(self, track_ids: list[str]) -> list[dict | None]:
+        """Fetch audio features — handles 403 (deprecated endpoint) gracefully."""
+        try:
+            resp = self._client.get(
+                f"{self.SPOTIFY_API}/audio-features",
+                params={"ids": ",".join(track_ids)},
+                headers=self._headers(),
+            )
+            if resp.status_code == 403:
+                print("  Audio features endpoint returned 403 (deprecated), skipping")
+                return []
+            resp.raise_for_status()
+            return resp.json().get("audio_features", [])
+        except httpx.HTTPStatusError:
+            return []
+
+    def close(self):
+        self._client.close()
+
 
 async def pass2_spotify(pg: asyncpg.Connection) -> dict:
     """Enrich recordings with Spotify track IDs and audio features."""
     stats = {"tracks_matched": 0, "tracks_failed": 0, "features_fetched": 0}
 
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        print("Pass 2: Skipping Spotify enrichment (no credentials)")
+    if not SPOTIFY_TOKEN_PROXY_URL:
+        print("Pass 2: Skipping Spotify enrichment (no token proxy URL)")
         return stats
 
-    import spotipy
-    from spotipy.oauth2 import SpotifyClientCredentials
-
-    sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-        client_id=SPOTIFY_CLIENT_ID,
-        client_secret=SPOTIFY_CLIENT_SECRET,
-    ))
+    sp = SpotifyClient(SPOTIFY_TOKEN_PROXY_URL)
 
     # Step 2a: Find Spotify track IDs for recordings that don't have them
     recordings = await pg.fetch("""
@@ -571,6 +629,7 @@ async def pass2_spotify(pg: asyncpg.Connection) -> dict:
             except Exception as e:
                 print(f"  Artist {art['name']}: error: {e}")
 
+    sp.close()
     return stats
 
 
