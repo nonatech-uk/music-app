@@ -1,4 +1,5 @@
 import { NavLink } from 'react-router-dom'
+import AppSwitcher from './AppSwitcher'
 
 const links = [
   { to: '/tracks', label: 'Tracks' },
@@ -9,7 +10,10 @@ const links = [
 export default function Sidebar() {
   return (
     <aside className="w-48 shrink-0 bg-bg-secondary border-r border-border p-4 flex flex-col gap-1">
-      <h1 className="text-lg font-bold mb-4 text-text-primary">Music</h1>
+      <div className="flex items-center justify-between mb-4">
+        <h1 className="text-lg font-bold text-text-primary">Music</h1>
+        <AppSwitcher />
+      </div>
       {links.map(({ to, label }) => (
         <NavLink
           key={to}

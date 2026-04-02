@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from music_app.api.deps import close_pool, init_pool
-from music_app.api.routers import artists, maloja, review, scrobbles, tracks
+from music_app.api.routers import artists, maloja, review, scrobbles, stats, tracks
 
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", Path(__file__).resolve().parent.parent.parent.parent / "static"))
 
@@ -55,6 +55,7 @@ app.include_router(tracks.router, prefix="/api/v1", tags=["tracks"])
 app.include_router(artists.router, prefix="/api/v1", tags=["artists"])
 app.include_router(scrobbles.router, prefix="/api/v1", tags=["scrobbles"])
 app.include_router(review.router, prefix="/api/v1", tags=["review"])
+app.include_router(stats.router, prefix="/api/v1", tags=["stats"])
 
 
 @app.get("/health")
