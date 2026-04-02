@@ -255,6 +255,402 @@ async def _upsert_release_group(
 
 
 # ---------------------------------------------------------------------------
+# Pass 0: Library tag harvesting
+# ---------------------------------------------------------------------------
+
+LIBRARY_PATH = os.environ.get("MUSIC_LIBRARY_PATH", "")
+LIBRARY_SCAN_CAP = int(os.environ.get("LIBRARY_SCAN_CAP", "0"))  # 0 = unlimited
+
+import re
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+
+def _valid_uuid(s: str | None) -> str | None:
+    """Return the string if it's a valid UUID, else None."""
+    if s and _UUID_RE.match(s):
+        return s
+    return None
+
+
+async def pass0_library_tags(pg: asyncpg.Connection) -> dict:
+    """Harvest MusicBrainz IDs from embedded file tags and backfill scrobble links."""
+    if not LIBRARY_PATH or not os.path.isdir(LIBRARY_PATH):
+        print("Pass 0: Skipped (MUSIC_LIBRARY_PATH not set or not found)")
+        return {"scanned": 0, "matched": 0, "skipped": 0}
+
+    from mutagen import File as MutagenFile
+
+    stats = {"scanned": 0, "matched": 0, "skipped": 0, "artists_seeded": 0}
+
+    # Get last scan timestamp (stored as an app_setting-style row in a small table)
+    await pg.execute("""
+        CREATE TABLE IF NOT EXISTS enrichment_state (
+            key text PRIMARY KEY,
+            value text NOT NULL
+        )
+    """)
+    last_scan_row = await pg.fetchval(
+        "SELECT value FROM enrichment_state WHERE key = 'library_scan_mtime'"
+    )
+    last_scan_mtime = float(last_scan_row) if last_scan_row else 0.0
+
+    max_mtime = last_scan_mtime
+    scanned = 0
+
+    print(f"Pass 0: Scanning library tags from {LIBRARY_PATH}")
+    if last_scan_mtime:
+        from datetime import datetime
+        print(f"  Only files modified after {datetime.fromtimestamp(last_scan_mtime).isoformat()}")
+
+    for root, _dirs, files in os.walk(LIBRARY_PATH):
+        for fname in files:
+            if not fname.endswith(('.m4a', '.flac', '.mp3')):
+                continue
+
+            fpath = os.path.join(root, fname)
+            try:
+                mtime = os.path.getmtime(fpath)
+            except OSError:
+                continue
+
+            if mtime <= last_scan_mtime:
+                stats["skipped"] += 1
+                continue
+
+            if LIBRARY_SCAN_CAP and scanned >= LIBRARY_SCAN_CAP:
+                break
+
+            if mtime > max_mtime:
+                max_mtime = mtime
+
+            try:
+                f = MutagenFile(fpath)
+                if not f or not f.tags:
+                    continue
+            except Exception:
+                continue
+
+            scanned += 1
+            tags = f.tags
+
+            # Extract MBIDs from tags (M4A freeform atoms, ID3 TXXX, Vorbis comments)
+            track_mbid = None
+            artist_mbid = None
+            for k in tags.keys():
+                kl = str(k).lower()
+                if 'musicbrainz track id' in kl:
+                    v = tags[k]
+                    if isinstance(v, list):
+                        v = v[0]
+                    track_mbid = str(v).strip("b'\"")
+                elif 'musicbrainz artist id' in kl:
+                    v = tags[k]
+                    if isinstance(v, list):
+                        v = v[0]
+                    artist_mbid = str(v).strip("b'\"")
+
+            track_mbid = _valid_uuid(track_mbid)
+            artist_mbid = _valid_uuid(artist_mbid)
+            if not track_mbid and not artist_mbid:
+                continue
+
+            # Extract basic tags for matching against scrobble link strings
+            artist_name = None
+            track_title = None
+            for label, keys in [
+                ('artist', ['\xa9ART', 'TPE1', 'artist']),
+                ('title', ['\xa9nam', 'TIT2', 'title']),
+            ]:
+                for tk in keys:
+                    try:
+                        v = tags[tk]
+                        if isinstance(v, list):
+                            v = v[0]
+                        if label == 'artist':
+                            artist_name = str(v)
+                        else:
+                            track_title = str(v)
+                        break
+                    except (KeyError, ValueError, IndexError):
+                        continue
+
+            if not artist_name or not track_title:
+                continue
+
+            artist_lower = artist_name.lower()
+            track_lower = track_title.lower()
+
+            # Try to match against existing scrobble link
+            link = await pg.fetchrow("""
+                SELECT id, artist_mbid, recording_mbid, manual_override
+                FROM music_scrobble_link
+                WHERE artist_string = $1 AND track_string = $2
+            """, artist_lower, track_lower)
+
+            if not link:
+                continue  # No scrobble for this file
+            if link["manual_override"]:
+                continue  # Don't overwrite manual links
+            if link["recording_mbid"] is not None:
+                continue  # Already resolved
+
+            # Ensure artist exists in music_artist
+            if artist_mbid:
+                existing_artist = await pg.fetchval(
+                    "SELECT mbid FROM music_artist WHERE mbid = $1::uuid", artist_mbid
+                )
+                if not existing_artist:
+                    await pg.execute("""
+                        INSERT INTO music_artist (mbid, name, created_at)
+                        VALUES ($1::uuid, $2, now())
+                        ON CONFLICT (mbid) DO NOTHING
+                    """, artist_mbid, artist_name)
+                    stats["artists_seeded"] += 1
+
+            # Ensure recording exists in music_recording
+            if track_mbid and artist_mbid:
+                await pg.execute("""
+                    INSERT INTO music_recording (mbid, artist_mbid, title, created_at)
+                    VALUES ($1::uuid, $2::uuid, $3, now())
+                    ON CONFLICT (mbid) DO NOTHING
+                """, track_mbid, artist_mbid, track_title)
+
+            # Update the scrobble link
+            if track_mbid and artist_mbid:
+                await pg.execute("""
+                    UPDATE music_scrobble_link
+                    SET artist_mbid = $1::uuid, recording_mbid = $2::uuid,
+                        resolution_method = 'file_tag', resolution_score = 1.0, resolved_at = now()
+                    WHERE id = $3
+                """, artist_mbid, track_mbid, link["id"])
+                stats["matched"] += 1
+                print(f"  Tag: {artist_name} - {track_title} -> linked from file")
+            elif artist_mbid and not link["artist_mbid"]:
+                await pg.execute("""
+                    UPDATE music_scrobble_link
+                    SET artist_mbid = $1::uuid, resolution_score = 1.0
+                    WHERE id = $2
+                """, artist_mbid, link["id"])
+
+    stats["scanned"] = scanned
+
+    # Save high-water mark
+    if max_mtime > last_scan_mtime:
+        await pg.execute("""
+            INSERT INTO enrichment_state (key, value) VALUES ('library_scan_mtime', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, str(max_mtime))
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Pass 0.5: Claude-assisted MusicBrainz disambiguation
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_CAP = int(os.environ.get("CLAUDE_CAP", "100"))  # max items per run
+
+
+async def _claude_pick_recording(
+    http: httpx.AsyncClient,
+    artist_name: str,
+    track_title: str,
+    album_title: str | None,
+    candidates: list[dict],
+) -> dict | None:
+    """Ask Claude to pick the best MusicBrainz recording match."""
+    if not candidates:
+        return None
+
+    candidate_lines = []
+    for i, c in enumerate(candidates):
+        releases = c.get("release-list", [])
+        release_info = ""
+        if releases:
+            albums = [r.get("title", "") for r in releases[:3]]
+            release_info = f" (albums: {', '.join(albums)})"
+        artists = "; ".join(
+            a.get("name", "") for a in c.get("artist-credit", []) if isinstance(a, dict)
+        )
+        candidate_lines.append(
+            f"  {i+1}. \"{c.get('title', '')}\" by {artists} [MBID: {c['id']}]{release_info}"
+        )
+
+    album_hint = f"\nAlbum context: \"{album_title}\"" if album_title else ""
+
+    prompt = f"""Match this scrobbled track to the correct MusicBrainz recording.
+
+Scrobble: "{artist_name}" - "{track_title}"{album_hint}
+
+Candidates:
+{chr(10).join(candidate_lines)}
+
+Key matching rules:
+- Scrobble titles are often SHORTENED or use COMMON NAMES. "Time of Your Life" IS "Good Riddance (Time of Your Life)". "Baker Street" IS "Baker Street".
+- Parenthetical extras like (Remastered), (Live), (Radio Edit) are usually fine — match the base song.
+- Cover versions performed by the scrobbled artist ARE valid matches.
+- Multi-part tracks with slashes (e.g. "A / B / C") may match a single combined recording.
+- Abbreviations: "ISHFWILF" could be "I Still Haven't Found What I'm Looking For".
+- Only say "none" if the song genuinely isn't in the candidates at all or the artist is completely wrong.
+
+Reply with ONLY the number or "none"."""
+
+    body = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 5,
+        "temperature": 0,
+        "messages": [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "My answer is:"},
+        ],
+    }
+    resp = await http.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json=body,
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    answer = data["content"][0]["text"].strip().lower()
+
+    # Extract number from answer — handle " 2", "2.", "2\n", etc.
+    answer = answer.strip()
+    if "none" in answer:
+        return None
+    # Find first number in the answer
+    m = re.search(r'\d+', answer)
+    if m:
+        idx = int(m.group()) - 1
+        if 0 <= idx < len(candidates):
+            return candidates[idx]
+    return None
+
+
+async def pass05_claude_disambiguation(pg: asyncpg.Connection) -> dict:
+    """Use Claude to resolve recordings that fuzzy matching missed."""
+    if not ANTHROPIC_API_KEY:
+        print("Pass 0.5: Skipped (ANTHROPIC_API_KEY not set)")
+        return {"resolved": 0, "failed": 0, "skipped": 0}
+
+    stats = {"resolved": 0, "failed": 0, "skipped": 0}
+
+    # Get unresolved recordings with artist MBID, ordered by play count
+    rows = await pg.fetch("""
+        SELECT sl.id AS link_id, sl.track_string, sl.artist_string, sl.artist_mbid,
+               t.title, t.album_title, a.name AS artist_name, sl.track_id,
+               (SELECT COUNT(*) FROM scrobble s WHERE s.track_id = sl.track_id) AS play_count
+        FROM music_scrobble_link sl
+        JOIN track t ON t.id = sl.track_id
+        JOIN artist a ON a.id = sl.artist_id
+        WHERE sl.artist_mbid IS NOT NULL
+          AND sl.recording_mbid IS NULL
+          AND NOT COALESCE(sl.manual_override, false)
+        ORDER BY play_count DESC
+        LIMIT $1
+    """, CLAUDE_CAP)
+
+    if not rows:
+        print("Pass 0.5: No unresolved recordings to process")
+        return stats
+
+    print(f"Pass 0.5: Claude disambiguation for {len(rows)} recordings...")
+
+    async with httpx.AsyncClient() as http:
+        for row in rows:
+            artist_name = row["artist_name"]
+            track_title = row["title"]
+            album_title = row["album_title"]
+
+            # Search MusicBrainz for candidates (broader search, more results)
+            try:
+                result = mb_search_recordings(track_title, artist_name, limit=10)
+                candidates = result.get("recording-list", [])
+            except Exception as e:
+                print(f"  MB search error for {artist_name} - {track_title}: {e}")
+                stats["skipped"] += 1
+                continue
+
+            if not candidates:
+                stats["failed"] += 1
+                continue
+
+            # Ask Claude to pick
+            try:
+                pick = await _claude_pick_recording(
+                    http, artist_name, track_title, album_title, candidates
+                )
+            except Exception as e:
+                print(f"  Claude error for {artist_name} - {track_title}: {e}")
+                stats["skipped"] += 1
+                continue
+
+            if pick:
+                recording_mbid = pick["id"]
+                recording_title = pick.get("title", "")
+
+                # Get artist MBID from the candidate
+                candidate_artist_mbid = None
+                for ac in pick.get("artist-credit", []):
+                    if isinstance(ac, dict) and ac.get("artist", {}).get("id"):
+                        candidate_artist_mbid = ac["artist"]["id"]
+                        break
+
+                artist_mbid = str(row["artist_mbid"])
+
+                # Upsert recording
+                isrc = None
+                rg_mbid = None
+                releases = pick.get("release-list", [])
+                if releases:
+                    r0 = releases[0]
+                    rg = r0.get("release-group", {})
+                    if rg.get("id"):
+                        rg_mbid = await _upsert_release_group(pg, rg, artist_mbid)
+
+                duration_ms = None
+                raw_length = pick.get("length")
+                if raw_length is not None:
+                    try:
+                        duration_ms = int(raw_length)
+                    except (ValueError, TypeError):
+                        pass
+
+                await pg.execute("""
+                    INSERT INTO music_recording (mbid, artist_mbid, title, release_group_mbid, duration_ms, isrc, mb_raw, created_at)
+                    VALUES ($1::uuid, $2::uuid, $3, $4::uuid, $5, $6, $7, now())
+                    ON CONFLICT (mbid) DO NOTHING
+                """, recording_mbid, artist_mbid, recording_title,
+                    rg_mbid, duration_ms, isrc, json.dumps(pick))
+
+                # Update the scrobble link
+                await pg.execute("""
+                    UPDATE music_scrobble_link
+                    SET recording_mbid = $1::uuid, resolution_method = 'claude',
+                        resolution_score = 0.95, resolved_at = now()
+                    WHERE id = $2
+                """, recording_mbid, row["link_id"])
+                stats["resolved"] += 1
+                print(f"  Claude: {artist_name} - {track_title} -> {recording_title} ({recording_mbid[:8]}...)")
+            else:
+                # Mark as failed so we don't re-process
+                await pg.execute("""
+                    UPDATE music_scrobble_link
+                    SET resolution_method = 'claude_failed', resolved_at = now(),
+                        resolution_attempts = COALESCE(resolution_attempts, 0) + 1
+                    WHERE id = $1
+                """, row["link_id"])
+                stats["failed"] += 1
+                print(f"  Claude: {artist_name} - {track_title} -> no match")
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Pass 1: MusicBrainz resolution
 # ---------------------------------------------------------------------------
 
@@ -743,6 +1139,14 @@ async def run() -> None:
         )
         print(f"Status: {resolved_artists}/{total_artists} artists, {resolved_tracks}/{total_tracks} tracks resolved")
         print("=" * 60)
+
+        # Pass 0: Library tag harvesting
+        lib_stats = await pass0_library_tags(pg)
+        print(f"\nPass 0 complete: {lib_stats}")
+
+        # Pass 0.5: Claude disambiguation
+        claude_stats = await pass05_claude_disambiguation(pg)
+        print(f"\nPass 0.5 complete: {claude_stats}")
 
         # Pass 1: MusicBrainz
         mb_stats = await pass1_musicbrainz(pg)
