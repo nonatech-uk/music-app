@@ -32,7 +32,7 @@ export default function Tracks() {
           placeholder="Search tracks or artists..."
           value={q}
           onChange={e => { setQ(e.target.value); setOffset(0) }}
-          className="px-3 py-1.5 text-sm border border-border rounded-md bg-bg-secondary text-text-primary placeholder:text-text-secondary focus:outline-none focus:ring-1 focus:ring-accent w-72"
+          className="px-3 py-1.5 text-sm border border-border rounded-md bg-bg-secondary text-text-primary placeholder:text-text-secondary focus:outline-none focus:ring-1 focus:ring-accent w-full sm:w-72"
         />
         <select
           value={sort}
@@ -51,7 +51,7 @@ export default function Tracks() {
         <p className="text-text-secondary py-8">No tracks found.</p>
       ) : (
         <>
-          <div className="bg-bg-card border border-border rounded-lg overflow-hidden">
+          <div className="bg-bg-card border border-border rounded-lg overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border bg-bg-secondary">

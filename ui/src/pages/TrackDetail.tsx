@@ -160,7 +160,7 @@ export default function TrackDetail() {
       {scrobbles && scrobbles.items.length > 0 && (
         <div>
           <h3 className="text-sm font-medium text-text-secondary mb-2">Recent Plays</h3>
-          <div className="bg-bg-card border border-border rounded-lg overflow-hidden">
+          <div className="bg-bg-card border border-border rounded-lg overflow-x-auto">
             <table className="w-full text-sm">
               <tbody>
                 {scrobbles.items.map(s => (

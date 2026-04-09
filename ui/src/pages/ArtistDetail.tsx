@@ -29,7 +29,7 @@ export default function ArtistDetail() {
       {artist.tracks.length > 0 && (
         <div>
           <h3 className="text-sm font-medium text-text-secondary mb-2">Tracks</h3>
-          <div className="bg-bg-card border border-border rounded-lg overflow-hidden">
+          <div className="bg-bg-card border border-border rounded-lg overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border bg-bg-secondary">
