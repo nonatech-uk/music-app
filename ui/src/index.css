@@ -1,6 +1,8 @@
 @import "tailwindcss";
+@import "@mees/shared-ui/styles/theme.css";
 
 @theme {
+  /* Music-app dark theme overrides */
   --color-bg-primary: #0f0f14;
   --color-bg-secondary: #1a1a24;
   --color-bg-card: #22222e;

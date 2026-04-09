@@ -1,5 +1,9 @@
 ## Stage 1: Build the React UI
 FROM node:22-slim AS ui-build
+
+WORKDIR /mees-shared-ui
+COPY mees-shared-ui/ .
+
 WORKDIR /ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
@@ -15,7 +19,11 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
+COPY mees-shared-py/ /tmp/mees-shared-py/
+RUN uv pip install --system --no-cache /tmp/mees-shared-py/
+
 COPY pyproject.toml .
+COPY config/ config/
 COPY src/ src/
 RUN uv pip install --system --no-cache .
 

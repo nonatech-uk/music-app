@@ -2,3 +2,7 @@ node_modules/
 ui/dist/
 __pycache__/
 *.pyc
+
+# Shared libraries copied during build
+mees-shared-py/
+mees-shared-ui/

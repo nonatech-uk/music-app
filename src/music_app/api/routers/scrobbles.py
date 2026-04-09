@@ -2,23 +2,24 @@
 
 from fastapi import APIRouter, Depends, Query
 
-import asyncpg
-
-from music_app.api.deps import get_conn
+from music_app.api.deps import dict_cursor, get_conn
 from music_app.api.models import ScrobbleItem, ScrobbleList
 
 router = APIRouter()
 
 
 @router.get("/scrobbles", response_model=ScrobbleList)
-async def list_scrobbles(
+def list_scrobbles(
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
-    conn: asyncpg.Connection = Depends(get_conn),
+    conn=Depends(get_conn),
 ):
-    total = await conn.fetchval("SELECT count(*) FROM scrobble")
+    cur = dict_cursor(conn)
 
-    rows = await conn.fetch("""
+    cur.execute("SELECT count(*) AS c FROM scrobble")
+    total = cur.fetchone()["c"]
+
+    cur.execute("""
         SELECT s.id, s.listened_at, s.track_id, s.duration,
                t.title AS track_title, t.album_title,
                array_agg(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) AS artist_names
@@ -28,8 +29,9 @@ async def list_scrobbles(
         LEFT JOIN artist a ON a.id = ta.artist_id
         GROUP BY s.id, t.id
         ORDER BY s.listened_at DESC
-        LIMIT $1 OFFSET $2
-    """, limit + 1, offset)
+        LIMIT %s OFFSET %s
+    """, (limit + 1, offset))
+    rows = cur.fetchall()
 
     has_more = len(rows) > limit
     items = [

@@ -1,26 +1,24 @@
 """Maloja-compatible API endpoints for multi-scrobbler."""
 
-import os
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
-from music_app.api import deps
+from config.settings import settings
+from music_app.api.deps import dict_cursor, get_conn
 
 router = APIRouter()
 
-API_KEY = os.environ.get("MALOJA_API_KEY", "")
-
 
 def _check_key(key: str | None) -> JSONResponse | None:
-    if not API_KEY or key != API_KEY:
+    if not settings.maloja_api_key or key != settings.maloja_api_key:
         return JSONResponse({"status": "error", "error": "invalid key"}, status_code=403)
     return None
 
 
 @router.get("/serverinfo")
-async def serverinfo():
+def serverinfo():
     return {
         "name": "music-app",
         "version": ["3", "2", "4"],
@@ -30,12 +28,12 @@ async def serverinfo():
 
 
 @router.get("/scrobbles")
-async def scrobbles():
+def scrobbles():
     return {"list": []}
 
 
 @router.get("/test")
-async def test(request: Request):
+def test(request: Request):
     err = _check_key(request.query_params.get("key"))
     if err:
         return err
@@ -43,7 +41,7 @@ async def test(request: Request):
 
 
 @router.post("/newscrobble")
-async def newscrobble(request: Request):
+async def newscrobble(request: Request, conn=Depends(get_conn)):
     body = await request.json()
 
     err = _check_key(body.get("key"))
@@ -68,43 +66,45 @@ async def newscrobble(request: Request):
 
     listened_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
 
-    async with deps.pool.acquire() as conn:
-        async with conn.transaction():
-            artist_ids: dict[str, int] = {}
-            for name in artists:
-                name = name.strip()
-                if not name:
-                    continue
-                aid = await conn.fetchval(
-                    """INSERT INTO artist (name, name_lower)
-                       VALUES ($1, $2)
-                       ON CONFLICT (name_lower) DO UPDATE SET name = EXCLUDED.name
-                       RETURNING id""",
-                    name, name.lower(),
-                )
-                artist_ids[name] = aid
+    cur = dict_cursor(conn)
 
-            track_id = await conn.fetchval(
-                """INSERT INTO track (title, title_lower, album_title, length_secs)
-                   VALUES ($1, $2, $3, $4)
-                   ON CONFLICT (title_lower, album_title) DO UPDATE SET title = EXCLUDED.title
-                   RETURNING id""",
-                title, title.lower(), album, length,
-            )
+    artist_ids: dict[str, int] = {}
+    for name in artists:
+        name = name.strip()
+        if not name:
+            continue
+        cur.execute(
+            """INSERT INTO artist (name, name_lower)
+               VALUES (%s, %s)
+               ON CONFLICT (name_lower) DO UPDATE SET name = EXCLUDED.name
+               RETURNING id""",
+            (name, name.lower()),
+        )
+        artist_ids[name] = cur.fetchone()["id"]
 
-            for aid in artist_ids.values():
-                await conn.execute(
-                    """INSERT INTO track_artist (track_id, artist_id)
-                       VALUES ($1, $2)
-                       ON CONFLICT DO NOTHING""",
-                    track_id, aid,
-                )
+    cur.execute(
+        """INSERT INTO track (title, title_lower, album_title, length_secs)
+           VALUES (%s, %s, %s, %s)
+           ON CONFLICT (title_lower, album_title) DO UPDATE SET title = EXCLUDED.title
+           RETURNING id""",
+        (title, title.lower(), album, length),
+    )
+    track_id = cur.fetchone()["id"]
 
-            await conn.execute(
-                """INSERT INTO scrobble (listened_at, track_id, duration, origin)
-                   VALUES ($1, $2, $3, $4)
-                   ON CONFLICT DO NOTHING""",
-                listened_at, track_id, duration, "multi-scrobbler",
-            )
+    for aid in artist_ids.values():
+        cur.execute(
+            """INSERT INTO track_artist (track_id, artist_id)
+               VALUES (%s, %s)
+               ON CONFLICT DO NOTHING""",
+            (track_id, aid),
+        )
+
+    cur.execute(
+        """INSERT INTO scrobble (listened_at, track_id, duration, origin)
+           VALUES (%s, %s, %s, %s)
+           ON CONFLICT DO NOTHING""",
+        (listened_at, track_id, duration, "multi-scrobbler"),
+    )
+    conn.commit()
 
     return {"status": "success", "track": {"artists": artists, "title": title}}

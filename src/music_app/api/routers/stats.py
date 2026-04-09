@@ -2,21 +2,25 @@
 
 from fastapi import APIRouter, Depends
 
-import asyncpg
-
-from music_app.api.deps import get_conn
+from music_app.api.deps import dict_cursor, get_conn
 
 router = APIRouter()
 
 
 @router.get("/stats/overview")
-async def overview(conn: asyncpg.Connection = Depends(get_conn)):
-    total_tracks = await conn.fetchval("SELECT count(*) FROM track")
-    total_artists = await conn.fetchval("SELECT count(*) FROM artist")
-    scrobbles_today = await conn.fetchval(
-        "SELECT count(*) FROM scrobble WHERE listened_at::date = CURRENT_DATE"
-    )
-    top_row = await conn.fetchrow("""
+def overview(conn=Depends(get_conn)):
+    cur = dict_cursor(conn)
+
+    cur.execute("SELECT count(*) AS c FROM track")
+    total_tracks = cur.fetchone()["c"]
+
+    cur.execute("SELECT count(*) AS c FROM artist")
+    total_artists = cur.fetchone()["c"]
+
+    cur.execute("SELECT count(*) AS c FROM scrobble WHERE listened_at::date = CURRENT_DATE")
+    scrobbles_today = cur.fetchone()["c"]
+
+    cur.execute("""
         SELECT a.name
         FROM scrobble s
         JOIN track_artist ta ON ta.track_id = s.track_id
@@ -26,6 +30,7 @@ async def overview(conn: asyncpg.Connection = Depends(get_conn)):
         ORDER BY count(*) DESC
         LIMIT 1
     """)
+    top_row = cur.fetchone()
 
     return {
         "total_tracks": total_tracks,

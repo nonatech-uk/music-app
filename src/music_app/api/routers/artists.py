@@ -2,30 +2,26 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-import asyncpg
-
-from music_app.api.deps import get_conn
+from music_app.api.deps import dict_cursor, get_conn
 from music_app.api.models import ArtistDetail, ArtistItem, ArtistList, TrackItem
 
 router = APIRouter()
 
 
 @router.get("/artists", response_model=ArtistList)
-async def list_artists(
+def list_artists(
     q: str | None = Query(None),
     sort: str = Query("name"),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
-    conn: asyncpg.Connection = Depends(get_conn),
+    conn=Depends(get_conn),
 ):
     conditions = []
     params: list = []
-    idx = 1
 
     if q:
-        conditions.append(f"a.name_lower LIKE ${idx}")
+        conditions.append("a.name_lower LIKE %s")
         params.append(f"%{q.lower()}%")
-        idx += 1
 
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -35,9 +31,12 @@ async def list_artists(
     }
     order = sort_map.get(sort, "a.name")
 
-    total = await conn.fetchval(f"SELECT count(*) FROM artist a {where}", *params)
+    cur = dict_cursor(conn)
 
-    rows = await conn.fetch(f"""
+    cur.execute(f"SELECT count(*) AS c FROM artist a {where}", params or None)
+    total = cur.fetchone()["c"]
+
+    cur.execute(f"""
         SELECT a.id, a.name,
                count(DISTINCT ta.track_id) AS track_count,
                count(DISTINCT s.id) AS scrobble_count
@@ -47,8 +46,9 @@ async def list_artists(
         {where}
         GROUP BY a.id
         ORDER BY {order}
-        LIMIT ${idx} OFFSET ${idx + 1}
-    """, *params, limit + 1, offset)
+        LIMIT %s OFFSET %s
+    """, params + [limit + 1, offset])
+    rows = cur.fetchall()
 
     has_more = len(rows) > limit
     items = [
@@ -64,25 +64,28 @@ async def list_artists(
 
 
 @router.get("/artists/{artist_id}", response_model=ArtistDetail)
-async def get_artist(
+def get_artist(
     artist_id: int,
-    conn: asyncpg.Connection = Depends(get_conn),
+    conn=Depends(get_conn),
 ):
-    row = await conn.fetchrow("""
+    cur = dict_cursor(conn)
+
+    cur.execute("""
         SELECT a.id, a.name,
                count(DISTINCT ta.track_id) AS track_count,
                count(DISTINCT s.id) AS scrobble_count
         FROM artist a
         LEFT JOIN track_artist ta ON ta.artist_id = a.id
         LEFT JOIN scrobble s ON s.track_id = ta.track_id
-        WHERE a.id = $1
+        WHERE a.id = %s
         GROUP BY a.id
-    """, artist_id)
+    """, (artist_id,))
+    row = cur.fetchone()
 
     if not row:
         raise HTTPException(404, "Artist not found")
 
-    tracks = await conn.fetch("""
+    cur.execute("""
         SELECT t.id, t.title, t.album_title, t.length_secs,
                array_agg(DISTINCT a2.name) FILTER (WHERE a2.name IS NOT NULL) AS artists,
                count(DISTINCT s.id) AS scrobble_count,
@@ -92,11 +95,12 @@ async def get_artist(
         LEFT JOIN track_artist ta2 ON ta2.track_id = t.id
         LEFT JOIN artist a2 ON a2.id = ta2.artist_id
         LEFT JOIN scrobble s ON s.track_id = t.id
-        WHERE ta.artist_id = $1
+        WHERE ta.artist_id = %s
         GROUP BY t.id
         ORDER BY scrobble_count DESC
         LIMIT 100
-    """, artist_id)
+    """, (artist_id,))
+    tracks = cur.fetchall()
 
     return ArtistDetail(
         id=row["id"],

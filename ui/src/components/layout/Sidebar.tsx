@@ -1,5 +1,5 @@
 import { Link, NavLink } from 'react-router-dom'
-import AppSwitcher from './AppSwitcher'
+import { AppSwitcher } from '@mees/shared-ui'
 
 const links = [
   { to: '/tracks', label: 'Tracks' },

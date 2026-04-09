@@ -2,9 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-import asyncpg
-
-from music_app.api.deps import get_conn
+from music_app.api.deps import dict_cursor, get_conn
 from music_app.api.models import (
     ScrobbleItem,
     ScrobbleList,
@@ -17,7 +15,7 @@ from music_app.api.models import (
 router = APIRouter()
 
 
-def _row_to_item(row: asyncpg.Record) -> TrackItem:
+def _row_to_item(row: dict) -> TrackItem:
     return TrackItem(
         id=row["id"],
         title=row["title"],
@@ -30,21 +28,19 @@ def _row_to_item(row: asyncpg.Record) -> TrackItem:
 
 
 @router.get("/tracks", response_model=TrackList)
-async def list_tracks(
+def list_tracks(
     q: str | None = Query(None),
     sort: str = Query("recent"),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
-    conn: asyncpg.Connection = Depends(get_conn),
+    conn=Depends(get_conn),
 ):
     conditions = []
     params: list = []
-    idx = 1
 
     if q:
-        conditions.append(f"(t.title_lower LIKE ${idx} OR EXISTS (SELECT 1 FROM track_artist ta2 JOIN artist a2 ON a2.id = ta2.artist_id WHERE ta2.track_id = t.id AND a2.name_lower LIKE ${idx}))")
-        params.append(f"%{q.lower()}%")
-        idx += 1
+        conditions.append("(t.title_lower LIKE %s OR EXISTS (SELECT 1 FROM track_artist ta2 JOIN artist a2 ON a2.id = ta2.artist_id WHERE ta2.track_id = t.id AND a2.name_lower LIKE %s))")
+        params.extend([f"%{q.lower()}%", f"%{q.lower()}%"])
 
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -55,9 +51,12 @@ async def list_tracks(
     }
     order = sort_map.get(sort, "last_scrobbled DESC NULLS LAST")
 
-    total = await conn.fetchval(f"SELECT count(*) FROM track t {where}", *params)
+    cur = dict_cursor(conn)
 
-    rows = await conn.fetch(f"""
+    cur.execute(f"SELECT count(*) AS c FROM track t {where}", params or None)
+    total = cur.fetchone()["c"]
+
+    cur.execute(f"""
         SELECT t.id, t.title, t.album_title, t.length_secs,
                array_agg(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) AS artists,
                count(DISTINCT s.id) AS scrobble_count,
@@ -69,8 +68,9 @@ async def list_tracks(
         {where}
         GROUP BY t.id
         ORDER BY {order}
-        LIMIT ${idx} OFFSET ${idx + 1}
-    """, *params, limit + 1, offset)
+        LIMIT %s OFFSET %s
+    """, params + [limit + 1, offset])
+    rows = cur.fetchall()
 
     has_more = len(rows) > limit
     items = [_row_to_item(r) for r in rows[:limit]]
@@ -78,11 +78,13 @@ async def list_tracks(
 
 
 @router.get("/tracks/{track_id}", response_model=TrackDetail)
-async def get_track(
+def get_track(
     track_id: int,
-    conn: asyncpg.Connection = Depends(get_conn),
+    conn=Depends(get_conn),
 ):
-    row = await conn.fetchrow("""
+    cur = dict_cursor(conn)
+
+    cur.execute("""
         SELECT t.id, t.title, t.album_title, t.length_secs,
                array_agg(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) AS artists,
                count(DISTINCT s.id) AS scrobble_count,
@@ -91,15 +93,15 @@ async def get_track(
         LEFT JOIN track_artist ta ON ta.track_id = t.id
         LEFT JOIN artist a ON a.id = ta.artist_id
         LEFT JOIN scrobble s ON s.track_id = t.id
-        WHERE t.id = $1
+        WHERE t.id = %s
         GROUP BY t.id
-    """, track_id)
+    """, (track_id,))
+    row = cur.fetchone()
 
     if not row:
         raise HTTPException(404, "Track not found")
 
-    # Enrichment data via scrobble link
-    enrichment = await conn.fetchrow("""
+    cur.execute("""
         SELECT DISTINCT ON (mr.mbid)
                ma.genres AS artist_genres,
                mr.spotify_track_id, mr.tempo, mr.energy, mr.valence,
@@ -109,13 +111,14 @@ async def get_track(
         FROM track_artist ta
         JOIN artist a ON a.id = ta.artist_id
         JOIN music_scrobble_link sl ON sl.artist_string = a.name_lower
-             AND sl.track_string = (SELECT title_lower FROM track WHERE id = $1)
+             AND sl.track_string = (SELECT title_lower FROM track WHERE id = %s)
         LEFT JOIN music_artist ma ON ma.mbid = sl.artist_mbid
         LEFT JOIN music_recording mr ON mr.mbid = sl.recording_mbid
         LEFT JOIN music_release_group rg ON rg.mbid = mr.release_group_mbid
-        WHERE ta.track_id = $1
+        WHERE ta.track_id = %s
         LIMIT 1
-    """, track_id)
+    """, (track_id, track_id))
+    enrichment = cur.fetchone()
 
     return TrackDetail(
         id=row["id"],
@@ -139,100 +142,101 @@ async def get_track(
 
 
 @router.put("/tracks/{track_id}", response_model=TrackDetail)
-async def update_track(
+def update_track(
     track_id: int,
     body: TrackUpdate,
-    conn: asyncpg.Connection = Depends(get_conn),
+    conn=Depends(get_conn),
 ):
-    existing = await conn.fetchrow("SELECT id FROM track WHERE id = $1", track_id)
-    if not existing:
+    cur = dict_cursor(conn)
+
+    cur.execute("SELECT id FROM track WHERE id = %s", (track_id,))
+    if not cur.fetchone():
         raise HTTPException(404, "Track not found")
 
-    async with conn.transaction():
-        updates = []
-        params: list = []
-        idx = 1
+    updates = []
+    params: list = []
 
-        if body.title is not None:
-            updates.append(f"title = ${idx}")
-            params.append(body.title)
-            idx += 1
-            updates.append(f"title_lower = ${idx}")
-            params.append(body.title.lower())
-            idx += 1
+    if body.title is not None:
+        updates.append("title = %s")
+        params.append(body.title)
+        updates.append("title_lower = %s")
+        params.append(body.title.lower())
 
-        if body.album_title is not None:
-            updates.append(f"album_title = ${idx}")
-            params.append(body.album_title or None)
-            idx += 1
+    if body.album_title is not None:
+        updates.append("album_title = %s")
+        params.append(body.album_title or None)
 
-        if body.length_secs is not None:
-            updates.append(f"length_secs = ${idx}")
-            params.append(body.length_secs)
-            idx += 1
+    if body.length_secs is not None:
+        updates.append("length_secs = %s")
+        params.append(body.length_secs)
 
-        if updates:
-            params.append(track_id)
-            await conn.execute(
-                f"UPDATE track SET {', '.join(updates)} WHERE id = ${idx}",
-                *params,
+    if updates:
+        params.append(track_id)
+        cur.execute(
+            f"UPDATE track SET {', '.join(updates)} WHERE id = %s",
+            params,
+        )
+
+    if body.artists is not None:
+        cur.execute("DELETE FROM track_artist WHERE track_id = %s", (track_id,))
+        for name in body.artists:
+            name = name.strip()
+            if not name:
+                continue
+            cur.execute(
+                """INSERT INTO artist (name, name_lower)
+                   VALUES (%s, %s)
+                   ON CONFLICT (name_lower) DO UPDATE SET name = EXCLUDED.name
+                   RETURNING id""",
+                (name, name.lower()),
+            )
+            aid = cur.fetchone()["id"]
+            cur.execute(
+                "INSERT INTO track_artist (track_id, artist_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (track_id, aid),
             )
 
-        if body.artists is not None:
-            await conn.execute("DELETE FROM track_artist WHERE track_id = $1", track_id)
-            for name in body.artists:
-                name = name.strip()
-                if not name:
-                    continue
-                aid = await conn.fetchval(
-                    """INSERT INTO artist (name, name_lower)
-                       VALUES ($1, $2)
-                       ON CONFLICT (name_lower) DO UPDATE SET name = EXCLUDED.name
-                       RETURNING id""",
-                    name, name.lower(),
-                )
-                await conn.execute(
-                    "INSERT INTO track_artist (track_id, artist_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                    track_id, aid,
-                )
-
-    return await get_track(track_id, conn)
+    conn.commit()
+    return get_track(track_id, conn)
 
 
 @router.delete("/tracks/{track_id}")
-async def delete_track(
+def delete_track(
     track_id: int,
-    conn: asyncpg.Connection = Depends(get_conn),
+    conn=Depends(get_conn),
 ):
-    existing = await conn.fetchrow("SELECT id FROM track WHERE id = $1", track_id)
-    if not existing:
+    cur = dict_cursor(conn)
+
+    cur.execute("SELECT id FROM track WHERE id = %s", (track_id,))
+    if not cur.fetchone():
         raise HTTPException(404, "Track not found")
 
-    async with conn.transaction():
-        await conn.execute("DELETE FROM scrobble WHERE track_id = $1", track_id)
-        await conn.execute("DELETE FROM music_scrobble_link WHERE track_id = $1", track_id)
-        await conn.execute("DELETE FROM track_artist WHERE track_id = $1", track_id)
-        await conn.execute("DELETE FROM track WHERE id = $1", track_id)
+    cur.execute("DELETE FROM scrobble WHERE track_id = %s", (track_id,))
+    cur.execute("DELETE FROM music_scrobble_link WHERE track_id = %s", (track_id,))
+    cur.execute("DELETE FROM track_artist WHERE track_id = %s", (track_id,))
+    cur.execute("DELETE FROM track WHERE id = %s", (track_id,))
+    conn.commit()
 
     return {"status": "deleted"}
 
 
 @router.get("/tracks/{track_id}/scrobbles", response_model=ScrobbleList)
-async def track_scrobbles(
+def track_scrobbles(
     track_id: int,
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
-    conn: asyncpg.Connection = Depends(get_conn),
+    conn=Depends(get_conn),
 ):
-    existing = await conn.fetchrow("SELECT id FROM track WHERE id = $1", track_id)
-    if not existing:
+    cur = dict_cursor(conn)
+
+    cur.execute("SELECT id FROM track WHERE id = %s", (track_id,))
+    if not cur.fetchone():
         raise HTTPException(404, "Track not found")
 
-    total = await conn.fetchval(
-        "SELECT count(*) FROM scrobble WHERE track_id = $1", track_id
-    )
+    cur.execute("SELECT count(*) AS c FROM scrobble WHERE track_id = %s", (track_id,))
+    total = cur.fetchone()["c"]
 
-    rows = await conn.fetch("""
+    cur.execute("""
         SELECT s.id, s.listened_at, s.track_id, s.duration,
                t.title AS track_title, t.album_title,
                array_agg(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) AS artist_names
@@ -240,11 +244,12 @@ async def track_scrobbles(
         JOIN track t ON t.id = s.track_id
         LEFT JOIN track_artist ta ON ta.track_id = t.id
         LEFT JOIN artist a ON a.id = ta.artist_id
-        WHERE s.track_id = $1
+        WHERE s.track_id = %s
         GROUP BY s.id, t.id
         ORDER BY s.listened_at DESC
-        LIMIT $2 OFFSET $3
-    """, track_id, limit + 1, offset)
+        LIMIT %s OFFSET %s
+    """, (track_id, limit + 1, offset))
+    rows = cur.fetchall()
 
     has_more = len(rows) > limit
     items = [
