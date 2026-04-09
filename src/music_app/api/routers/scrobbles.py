@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, Query
 
-from music_app.api.deps import dict_cursor, get_conn
+from music_app.api.deps import CurrentUser, dict_cursor, get_conn, get_current_user
 from music_app.api.models import ScrobbleItem, ScrobbleList
 
 router = APIRouter()
@@ -12,6 +12,7 @@ router = APIRouter()
 def list_scrobbles(
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)

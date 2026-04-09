@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from music_app.api.deps import dict_cursor, get_conn
+from music_app.api.deps import CurrentUser, dict_cursor, get_conn, get_current_user
 from music_app.api.models import ArtistDetail, ArtistItem, ArtistList, TrackItem
 
 router = APIRouter()
@@ -14,6 +14,7 @@ def list_artists(
     sort: str = Query("name"),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     conditions = []
@@ -66,6 +67,7 @@ def list_artists(
 @router.get("/artists/{artist_id}", response_model=ArtistDetail)
 def get_artist(
     artist_id: int,
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)

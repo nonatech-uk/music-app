@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from music_app.api.deps import dict_cursor, get_conn
+from music_app.api.deps import CurrentUser, dict_cursor, get_conn, get_current_user
 from music_app.api.models import (
     ScrobbleItem,
     ScrobbleList,
@@ -33,6 +33,7 @@ def list_tracks(
     sort: str = Query("recent"),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     conditions = []
@@ -80,6 +81,7 @@ def list_tracks(
 @router.get("/tracks/{track_id}", response_model=TrackDetail)
 def get_track(
     track_id: int,
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -145,6 +147,7 @@ def get_track(
 def update_track(
     track_id: int,
     body: TrackUpdate,
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -203,6 +206,7 @@ def update_track(
 @router.delete("/tracks/{track_id}")
 def delete_track(
     track_id: int,
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -225,6 +229,7 @@ def track_scrobbles(
     track_id: int,
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)

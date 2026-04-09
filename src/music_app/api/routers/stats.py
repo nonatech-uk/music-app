@@ -2,13 +2,13 @@
 
 from fastapi import APIRouter, Depends
 
-from music_app.api.deps import dict_cursor, get_conn
+from music_app.api.deps import CurrentUser, dict_cursor, get_conn, get_current_user
 
 router = APIRouter()
 
 
 @router.get("/stats/overview")
-def overview(conn=Depends(get_conn)):
+def overview(_user: CurrentUser = Depends(get_current_user), conn=Depends(get_conn)):
     cur = dict_cursor(conn)
 
     cur.execute("SELECT count(*) AS c FROM track")

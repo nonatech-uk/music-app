@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from music_app.api.deps import dict_cursor, get_conn
+from music_app.api.deps import CurrentUser, dict_cursor, get_conn, get_current_user
 from music_app.api.models import (
     DuplicateCandidate,
     DuplicateList,
@@ -17,7 +17,7 @@ router = APIRouter()
 
 
 @router.get("/review/stats", response_model=ReviewStats)
-def review_stats(conn=Depends(get_conn)):
+def review_stats(_user: CurrentUser = Depends(get_current_user), conn=Depends(get_conn)):
     cur = dict_cursor(conn)
     cur.execute("""
         SELECT
@@ -64,6 +64,7 @@ def _row_to_review_item(row: dict) -> ReviewItem:
 def list_unresolved(
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -100,6 +101,7 @@ def list_unresolved(
 def list_failed(
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -133,6 +135,7 @@ def list_low_confidence(
     threshold: float = Query(0.95),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -172,6 +175,7 @@ def list_low_confidence(
 def update_link(
     link_id: int,
     body: LinkUpdate,
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -205,6 +209,7 @@ def update_link(
 @router.post("/review/confirm/{link_id}")
 def confirm_link(
     link_id: int,
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -224,6 +229,7 @@ def confirm_link(
 @router.post("/review/reject/{link_id}")
 def reject_link(
     link_id: int,
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -247,6 +253,7 @@ def list_duplicates(
     type: str = Query("artist"),
     threshold: float = Query(0.7),
     limit: int = Query(50, le=100),
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
@@ -282,6 +289,7 @@ def list_duplicates(
 @router.post("/review/merge")
 def merge_artists(
     body: MergeRequest,
+    _user: CurrentUser = Depends(get_current_user),
     conn=Depends(get_conn),
 ):
     cur = dict_cursor(conn)
