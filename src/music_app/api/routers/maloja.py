@@ -11,6 +11,14 @@ from music_app.api.deps import dict_cursor, get_conn
 router = APIRouter()
 
 
+def _parse_time(val: str) -> datetime:
+    """Parse YYYY/MM/DD date string or Unix timestamp."""
+    try:
+        return datetime.strptime(val, "%Y/%m/%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return datetime.fromtimestamp(int(val), tz=timezone.utc)
+
+
 def _check_key(key: str | None) -> JSONResponse | None:
     if not settings.maloja_api_key or key != settings.maloja_api_key:
         return JSONResponse({"status": "error", "error": "invalid key"}, status_code=403)
@@ -28,8 +36,65 @@ def serverinfo():
 
 
 @router.get("/scrobbles")
-def scrobbles():
-    return {"list": []}
+def scrobbles(
+    request: Request,
+    conn=Depends(get_conn),
+):
+    params = request.query_params
+    since = params.get("from") or params.get("since")
+    to = params.get("to") or params.get("until")
+    page = int(params.get("page", 0))
+    perpage = min(int(params.get("perpage", 100)), 1000)
+
+    conditions = []
+    values: list = []
+    if since:
+        conditions.append("s.listened_at >= %s")
+        values.append(_parse_time(since))
+    if to:
+        conditions.append("s.listened_at < %s")
+        values.append(_parse_time(to))
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    cur = dict_cursor(conn)
+    cur.execute(f"""
+        SELECT s.listened_at, s.duration,
+               t.title, t.album_title, t.length_secs,
+               array_agg(DISTINCT a.name) FILTER (WHERE a.name IS NOT NULL) AS artist_names
+        FROM scrobble s
+        JOIN track t ON t.id = s.track_id
+        LEFT JOIN track_artist ta ON ta.track_id = t.id
+        LEFT JOIN artist a ON a.id = ta.artist_id
+        {where}
+        GROUP BY s.id, t.id
+        ORDER BY s.listened_at ASC
+        LIMIT %s OFFSET %s
+    """, (*values, perpage, page * perpage))
+    rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        result.append({
+            "time": int(r["listened_at"].timestamp()),
+            "track": {
+                "artists": r["artist_names"] or [],
+                "title": r["title"],
+                "album": r["album_title"],
+                "length": r["length_secs"],
+            },
+            "duration": r["duration"],
+        })
+
+    return {
+        "status": "ok",
+        "list": result,
+        "pagination": {
+            "page": page,
+            "perpage": perpage,
+            "next_page": page + 1 if len(rows) == perpage else None,
+        },
+    }
 
 
 @router.get("/test")
